@@ -1,0 +1,10 @@
+node_modules
+dist
+.chrome-profile
+.npm-cache
+.shots
+.tmp
+.wrangler
+*.local
+.DS_Store
+
