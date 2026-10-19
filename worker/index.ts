@@ -124,8 +124,15 @@ async function handleBili(request: Request): Promise<Response> {
   try {
     const params = new URL(request.url).searchParams
     debug = params.has('debug')
-    const fail = (message: string, status: number) =>
-      reply({ ok: false, message, ...(debug ? { trace } : {}) }, status)
+    const fail = (message: string, status: number) => {
+      const payload = { ok: false, message, ...(debug ? { trace } : {}) }
+      if (status >= 500) {
+        console.error('bili parse: response', { status, message, trace })
+      } else {
+        console.log('bili parse: response', { status, message })
+      }
+      return reply(payload, status)
+    }
     const raw = `${params.get('text') ?? ''} ${params.get('bvid') ?? ''}`.trim()
     if (!raw) {
       console.log('bili parse: missing link')
