@@ -1,9 +1,9 @@
 /**
- * 解析 B 站分享链接，返回标题、封面和可直接下载的视频地址。
+ * Cloudflare Worker：托管静态站点，并处理 B 站解析与下载转发。
  *
  * 浏览器的 fetch 既无法带 Referer，也跨不过 api.bilibili.com 的 CORS，
- * 所以用 Pages Function 转发一次，这也是所有纯前端解析方案都绕不开的一跳。
- * 视频取的是 platform=html5 的整段 mp4（音视频在一起），不挑清晰度。
+ * 所以 B 站接口需要经过 Worker 转发。视频取 platform=html5 的整段 MP4，
+ * 音视频已合在一起，不挑清晰度。
  */
 
 const UA =
@@ -11,8 +11,14 @@ const UA =
 
 const BVID = /BV[0-9A-Za-z]{10}/
 const SHORT_LINK = /https?:\/\/b23\.tv\/[0-9A-Za-z]+/
+const ALLOWED_DOWNLOAD_HOSTS = ['bilivideo.com', 'bilivideo.cn', 'akamaized.net', 'bilibili.com']
+const PASS_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag']
 
-type Ctx = { request: Request }
+type Env = {
+  ASSETS: {
+    fetch(request: Request): Promise<Response>
+  }
+}
 
 type BiliData = {
   bvid?: string
@@ -41,7 +47,7 @@ const reply = (data: unknown, status = 200) =>
     },
   })
 
-function api(path: string, cookie = '') {
+function biliApi(path: string, cookie = '') {
   const headers: Record<string, string> = {
     'user-agent': UA,
     referer: 'https://www.bilibili.com/',
@@ -56,12 +62,13 @@ async function call(path: string, cookie: string, trace: string[]): Promise<Call
   const label = `${cookie ? '带 cookie' : '不带 cookie'} ${path}`
   let response: Response
   try {
-    response = await api(path, cookie)
+    response = await biliApi(path, cookie)
   } catch (reason) {
     const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
     trace.push(`${label} -> 请求失败 ${message}`)
     throw new Error(`连接 B 站接口失败（${message}）`)
   }
+
   const body = await response.text()
   let data: BiliJson | null = null
   try {
@@ -69,13 +76,20 @@ async function call(path: string, cookie: string, trace: string[]): Promise<Call
   } catch {
     data = null
   }
+
   const snippet = data ? '' : body.trim().slice(0, 200)
   trace.push(
     `${label} -> ${response.status} ${response.headers.get('content-type') ?? '无类型'} ${
       data ? `code ${data.code} ${data.message ?? ''}`.trim() : `非 JSON：${snippet || '空响应'}`
     }`,
   )
-  return { status: response.status, data, snippet, type: response.headers.get('content-type') ?? '' }
+
+  return {
+    status: response.status,
+    data,
+    snippet,
+    type: response.headers.get('content-type') ?? '',
+  }
 }
 
 function describe(result: Call, step: string) {
@@ -103,16 +117,20 @@ function fakeCookie() {
   return `buvid3=${crypto.randomUUID().toUpperCase()}infoc; b_nut=${Math.floor(Date.now() / 1000)}`
 }
 
-export const onRequestGet = async ({ request }: Ctx): Promise<Response> => {
+async function handleBili(request: Request): Promise<Response> {
   const trace: string[] = []
   let debug = false
+
   try {
     const params = new URL(request.url).searchParams
     debug = params.has('debug')
     const fail = (message: string, status: number) =>
       reply({ ok: false, message, ...(debug ? { trace } : {}) }, status)
     const raw = `${params.get('text') ?? ''} ${params.get('bvid') ?? ''}`.trim()
-    if (!raw) return fail('没有收到链接', 400)
+    if (!raw) {
+      console.log('bili parse: missing link')
+      return fail('没有收到链接', 400)
+    }
 
     let cookie = ''
     // 第一次不带 cookie，被风控拦下（-412 / 非 JSON）就带着首页 cookie 再来一次
@@ -135,6 +153,8 @@ export const onRequestGet = async ({ request }: Ctx): Promise<Response> => {
       bvid = response.url.match(BVID)?.[0] ?? (await response.text()).match(BVID)?.[0]
       if (!bvid) return fail('短链解析失败，请换成完整链接', 400)
     }
+
+    console.log('bili parse: start', { bvid, debug })
 
     const info = await load(`/x/web-interface/view?bvid=${bvid}`)
     if (info.data?.code !== 0 || !info.data.data) {
@@ -167,6 +187,7 @@ export const onRequestGet = async ({ request }: Ctx): Promise<Response> => {
     }
 
     const format = playData?.support_formats?.find((item) => item.quality === playData.quality)
+    console.log('bili parse: success', { bvid, files: files.length })
 
     return reply({
       ok: true,
@@ -179,9 +200,92 @@ export const onRequestGet = async ({ request }: Ctx): Promise<Response> => {
       files,
     })
   } catch (reason) {
-    const message =
-      reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
-    console.error('bili parse failed:', message)
+    const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
+    console.error('bili parse: failed', { message, trace })
     return reply({ ok: false, message: `解析失败：${message}`, ...(debug ? { trace } : {}) }, 502)
   }
+}
+
+function allowedDownload(target: string) {
+  try {
+    const { protocol, hostname } = new URL(target)
+    return (
+      protocol === 'https:' &&
+      ALLOWED_DOWNLOAD_HOSTS.some(
+        (host) => hostname === host || hostname.endsWith(`.${host}`),
+      )
+    )
+  } catch {
+    return false
+  }
+}
+
+function asciiName(value: string) {
+  return value.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || 'bilibili-video'
+}
+
+async function handleDownload(request: Request): Promise<Response> {
+  const fail = (message: string, status: number) =>
+    new Response(JSON.stringify({ ok: false, message }), {
+      status,
+      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    })
+
+  try {
+    const params = new URL(request.url).searchParams
+    const target = params.get('url') ?? ''
+    if (!allowedDownload(target)) return fail('地址不在允许范围内', 400)
+
+    const host = new URL(target).hostname
+    const range = request.headers.get('range')
+    console.log('bili download: start', { host, range: range ?? 'full' })
+
+    const upstream = await fetch(target, {
+      headers: {
+        'user-agent': UA,
+        referer: 'https://www.bilibili.com/',
+        origin: 'https://www.bilibili.com',
+        ...(range ? { range } : {}),
+      },
+    })
+
+    console.log('bili download: upstream', { host, status: upstream.status })
+
+    if (!upstream.ok && upstream.status !== 206) {
+      return fail(`源站返回 ${upstream.status}，请稍后重试或改用直链下载`, 502)
+    }
+
+    const base = (params.get('name') || 'bilibili-video')
+      .replace(/\.mp4$/i, '')
+      .replace(/[\r\n"\\]/g, '')
+      .slice(0, 80)
+    const headers = new Headers({ 'cache-control': 'no-store' })
+    for (const key of PASS_HEADERS) {
+      const value = upstream.headers.get(key)
+      if (value) headers.set(key, value)
+    }
+    headers.set(
+      'content-disposition',
+      `attachment; filename="${asciiName(base)}.mp4"; filename*=UTF-8''${encodeURIComponent(base)}.mp4`,
+    )
+
+    return new Response(upstream.body, { status: upstream.status, headers })
+  } catch (reason) {
+    const message = reason instanceof Error ? reason.message : String(reason)
+    console.error('bili download: failed', { message })
+    return fail(`下载失败：${message}`, 502)
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const { pathname } = new URL(request.url)
+    const path = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname
+
+    if (path === '/api/bili') return handleBili(request)
+    if (path === '/api/bili-download') return handleDownload(request)
+    if (path.startsWith('/api/')) return reply({ ok: false, message: '接口不存在' }, 404)
+
+    return env.ASSETS.fetch(request)
+  },
 }

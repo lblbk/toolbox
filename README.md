@@ -1,6 +1,6 @@
 # 工具箱
 
-一个部署在 Cloudflare Pages 的在线小工具集合：首页是索引页，点击卡片后弹框直接使用。
+一个部署在 Cloudflare Workers 的在线小工具集合：首页是索引页，点击卡片后弹框直接使用。
 除 B 站视频下载需要服务端转发一次请求外，其余工具都在浏览器本地完成计算，不保存输入内容。
 
 ## 技术栈
@@ -24,9 +24,9 @@
 
 二维码在浏览器内绘制到 canvas，下载的 PNG / SVG 都不带任何水印，中文内容按 UTF-8 编码。
 
-B 站视频下载通过 `functions/api/` 下的 Pages Function 转发：浏览器既无法设置 Referer，
+B 站视频下载通过 `worker/index.ts` 转发：浏览器既无法设置 Referer，
 也跨不过 `api.bilibili.com` 的 CORS，因此这一跳必须放在服务端。视频取的是整段 MP4
-（音视频已合在一起），不挑清晰度；下载时同样由 Function 补上 Referer 再转发。
+（音视频已合在一起），不挑清晰度；下载时同样由 Worker 补上 Referer 再转发。
 
 ## 本地开发
 
@@ -35,25 +35,39 @@ npm install
 npm run dev
 ```
 
-`npm run dev` 是纯静态预览，B 站解析会提示找不到接口。要连接口一起跑：
+`npm run dev` 是纯静态预览，B 站解析会提示找不到接口。要连 Worker 接口一起跑：
 
 ```bash
 npm run build
-npx wrangler pages dev
+npx wrangler dev
 ```
 
 ## 部署
 
-代码推到 GitHub `main` 分支，Cloudflare Pages 自动构建发布，线上地址 `https://tb.lblbk.top`。
+代码推到 GitHub `main` 分支，Cloudflare Workers 自动构建发布，线上地址 `https://tb.lblbk.top`。
+
+在 Cloudflare 控制台进入 **Workers & Pages → Create → Workers → Connect to Git**，选择
+`lblbk/toolbox`，然后填写：
 
 | 配置项 | 值 |
 | --- | --- |
-| Framework preset | Vite |
+| Worker name | `toolbox` |
+| Branch | `main` |
 | Build command | `npm run build` |
-| Build output directory | `dist` |
+| Deploy command | `npx wrangler deploy` |
 
-`functions/` 会跟着同一次构建自动编译成 `/api/bili`、`/api/bili-download`，
-和静态页面一起发布，不用单独建项目。项目使用 hash 路由（`#qr`、`#bilibili`），无需 SPA 回退规则。
+`wrangler.toml` 会把 `dist/` 作为静态资源发布，同时把 `/api/*` 交给 `worker/index.ts`。
+项目使用 hash 路由（`#qr`、`#bilibili`），静态资源不需要额外的 SPA 回退规则。
+
+Worker 创建后，在 **Settings → Domains & Routes** 中把 `tb.lblbk.top` 添加为 Custom Domain。
+如果这个域名当前绑在旧的 Pages 项目上，需要先解绑，再绑定到新的 Worker。
+
+Worker 日志默认开启，可在 **Workers & Pages → toolbox → Logs** 中按时间查询，
+也可以在本地执行：
+
+```bash
+npx wrangler tail
+```
 
 部署后验证接口：
 
@@ -61,7 +75,7 @@ npx wrangler pages dev
 curl "https://tb.lblbk.top/api/bili?bvid=BV1P88w6xE2u"
 ```
 
-返回带 `files` 的 JSON 就说明接口生效了。
+返回带 `files` 的 JSON 就说明 Worker 和接口都已生效。
 
 ## 目录结构
 
@@ -71,8 +85,8 @@ src/
   hooks/             hash 路由（弹框与 URL 同步）
   tools/             每个工具一个文件，并在 index.ts 注册
   App.tsx            首页索引与搜索
-functions/
-  api/               Pages Functions（B 站解析与下载转发）
+worker/
+  index.ts           Worker 入口（静态资源、B 站解析与下载转发）
 ```
 
 ## 新增一个工具
