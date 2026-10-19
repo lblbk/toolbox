@@ -45,10 +45,20 @@ function BilibiliTool() {
     setState({ status: 'loading' })
     try {
       const response = await fetch(`/api/bili?text=${encodeURIComponent(text)}`)
-      if (!(response.headers.get('content-type') ?? '').includes('application/json')) {
-        throw new Error('没有找到解析接口，本地预览请用 npx wrangler pages dev')
+      const body = await response.text()
+      let data: ({ ok: true } & Result) | { ok?: false; message?: string } | null = null
+      try {
+        data = JSON.parse(body) as ({ ok: true } & Result) | { ok?: false; message?: string }
+      } catch {
+        data = null
       }
-      const data = (await response.json()) as ({ ok: true } & Result) | { ok?: false; message?: string }
+      if (!data) {
+        throw new Error(
+          response.status === 404
+            ? '没有找到解析接口，这次部署可能没带上 functions/ 目录'
+            : `接口返回 ${response.status}：${body.trim().slice(0, 120) || '空响应'}`,
+        )
+      }
       if (!data.ok) throw new Error(data.message || `解析失败（${response.status}）`)
       setState({ status: 'done', result: data })
     } catch (reason) {
