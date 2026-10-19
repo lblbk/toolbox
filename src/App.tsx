@@ -99,7 +99,7 @@ export default function App() {
                   {query.trim() ? '搜索结果' : '全部工具'}
                 </h2>
                 <p className="mt-1 text-[13px] text-zinc-500">
-                  全部在浏览器本地运行，数据不会上传
+                  绝大多数工具在浏览器本地运行，输入内容不上传
                 </p>
               </div>
               <span className="shrink-0 rounded-full border border-zinc-200/80 bg-white px-2.5 py-1 text-xs font-medium text-zinc-500 shadow-sm">

@@ -46,9 +46,17 @@ export function Button({ variant = 'outline', className = '', ...props }: Button
     <button
       type="button"
       {...props}
-      className={`inline-flex h-8 items-center justify-center gap-1.5 rounded-lg px-3 text-xs font-medium transition duration-150 outline-none focus-visible:ring-2 focus-visible:ring-violet-500/40 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40 ${buttonVariants[variant]} ${className}`}
+      className={buttonClass(variant, className)}
     />
   )
+}
+
+/** 与 Button 同样的外观，供 <a> 这类不能包在按钮里的元素复用 */
+export function buttonClass(
+  variant: NonNullable<ButtonProps['variant']> = 'outline',
+  className = '',
+) {
+  return `inline-flex h-8 items-center justify-center gap-1.5 rounded-lg px-3 text-xs font-medium transition duration-150 outline-none focus-visible:ring-2 focus-visible:ring-violet-500/40 active:scale-[0.98] disabled:pointer-events-none disabled:opacity-40 ${buttonVariants[variant]} ${className}`
 }
 
 export function Segmented<T extends string>({
