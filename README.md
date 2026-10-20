@@ -1,7 +1,7 @@
 # 工具箱
 
 一个部署在 Cloudflare Workers 的在线小工具集合：首页是索引页，点击卡片后弹框直接使用。
-除 B 站视频下载需要服务端转发一次请求外，其余工具都在浏览器本地完成计算，不保存输入内容。
+除 B 站视频下载需要请求解析服务外，其余工具都在浏览器本地完成计算，不保存输入内容。
 
 ## 技术栈
 
@@ -24,10 +24,11 @@
 
 二维码在浏览器内绘制到 canvas，下载的 PNG / SVG 都不带任何水印，中文内容按 UTF-8 编码。
 
-B 站视频下载由 `worker/index.ts` 调用第三方解析接口完成。解析时优先请求
-`api.injahow.cn`，失败后自动切换到 `bili.nekocha.top`；Worker 不会直连
-`api.bilibili.com`。视频取整段 MP4（音视频已合在一起），不挑清晰度，下载时由 Worker
-补上 Referer 再转发。
+B 站视频下载由 `worker/index.ts` 调用解析接口完成。解析时优先请求自建服务
+`https://biliapi.lblbk.top/api/video`，失败后再依次尝试 `api.injahow.cn` 和
+`bili.nekocha.top`；Worker 不会直连 `api.bilibili.com`。视频取整段 MP4
+（音视频已合在一起），不挑清晰度。自建服务返回代理链接时，Worker 会取出其中的
+B 站 CDN 地址，补上 Referer 后转发下载。
 
 ## 本地开发
 

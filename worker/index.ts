@@ -1,8 +1,8 @@
 /**
- * Cloudflare Worker：托管静态站点，并通过第三方服务解析 B 站视频。
+ * Cloudflare Worker：托管静态站点，并通过 B 站解析服务获取视频地址。
  *
  * B 站会限制 Cloudflare 的出口 IP，因此这里不直接请求 api.bilibili.com。
- * injahow 响应更快，优先使用；失败时再调用 nekocha 获取完整信息和下载地址。
+ * 优先使用自建 biliapi，失败时再调用公开服务作为备用。
  */
 
 const UA =
@@ -10,9 +10,11 @@ const UA =
 
 const BVID_RE = /BV[0-9A-Za-z]{10}/
 const SHORT_LINK_RE = /https?:\/\/b23\.tv\/[0-9A-Za-z]+/
+const OWN_BILI_API = 'https://biliapi.lblbk.top/api/video'
 const INJAHOW_API = 'https://api.injahow.cn/bparse/'
 const NEKOCHA_API = 'https://bili.nekocha.top/video'
 const ALLOWED_DOWNLOAD_HOSTS = [
+  'biliapi.lblbk.top',
   'bilivideo.com',
   'bilivideo.cn',
   'akamaized.net',
@@ -37,7 +39,7 @@ type VideoFile = {
 }
 
 type ParseResult = {
-  source: 'injahow' | 'nekocha'
+  source: 'biliapi' | 'injahow' | 'nekocha'
   bvid: string
   title: string
   cover: string
@@ -147,10 +149,16 @@ async function resolveBvid(raw: string, requestId: string, trace: string[]) {
   }
 }
 
-async function publicJson(url: URL, source: string, requestId: string, trace: string[]) {
+async function publicJson(
+  url: URL,
+  source: string,
+  requestId: string,
+  trace: string[],
+  timeoutMs = 10_000,
+) {
   const started = Date.now()
   const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), 10_000)
+  const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
   try {
     const response = await fetch(url, {
@@ -171,7 +179,7 @@ async function publicJson(url: URL, source: string, requestId: string, trace: st
 
     const elapsedMs = Date.now() - started
     const detail = data
-      ? `HTTP ${response.status} code ${String(data.code ?? '-')} ${textValue(data.message)}`.trim()
+      ? `HTTP ${response.status} code ${String(data.code ?? data.status ?? '-')} ${textValue(data.message)}`.trim()
       : `HTTP ${response.status} 非 JSON：${body.trim().slice(0, 120) || '空响应'}`
     trace.push(`${source} -> ${detail} (${elapsedMs}ms)`)
     console.log('bili parse: upstream', {
@@ -198,6 +206,44 @@ async function publicJson(url: URL, source: string, requestId: string, trace: st
   }
 }
 
+function unwrapOwnProxy(value: string) {
+  try {
+    const proxy = new URL(value)
+    if (
+      proxy.protocol !== 'https:' ||
+      proxy.hostname !== 'biliapi.lblbk.top' ||
+      proxy.pathname !== '/proxy'
+    ) {
+      return value
+    }
+
+    const target = proxy.searchParams.get('url')
+    return target && validVideoUrl(target) ? target : value
+  } catch {
+    return value
+  }
+}
+
+function normalizeOwnParser(data: JsonObject | null): ParseResult | null {
+  if (!data || data.status !== 'success') return null
+
+  const bvid = textValue(data.bvid)
+  const sourceUrl = textValue(data.downloadUrl) || textValue(data.playableUrl)
+  const fileUrl = unwrapOwnProxy(sourceUrl)
+  if (!BVID_RE.test(bvid) || !validVideoUrl(fileUrl)) return null
+
+  return {
+    source: 'biliapi',
+    bvid,
+    title: textValue(data.title) || `B 站视频 ${bvid}`,
+    cover: textValue(data.pic).replace(/^http:/, 'https:'),
+    up: textValue(data.author),
+    duration: 0,
+    quality: qualityLabel(data.quality),
+    files: [{ url: fileUrl, size: 0, order: 1 }],
+  }
+}
+
 function validVideoUrl(value: unknown) {
   if (typeof value !== 'string' || !value.startsWith('https://')) return false
   try {
@@ -208,6 +254,15 @@ function validVideoUrl(value: unknown) {
   } catch {
     return false
   }
+}
+
+async function tryOwnParser(raw: string, requestId: string, trace: string[]) {
+  const url = new URL(OWN_BILI_API)
+  url.searchParams.set('text', raw)
+  url.searchParams.set('qn', '64')
+
+  const response = await publicJson(url, 'biliapi', requestId, trace, 25_000)
+  return normalizeOwnParser(response.data)
 }
 
 function normalizeInjahow(data: JsonObject | null, bvid: string): ParseResult | null {
@@ -292,38 +347,50 @@ async function handleBili(request: Request): Promise<Response> {
     const raw = `${params.get('text') ?? ''} ${params.get('bvid') ?? ''}`.trim()
     if (!raw) return fail('没有收到链接', 400)
 
-    const bvid = await resolveBvid(raw, requestId, trace)
-    if (!bvid) return fail('没找到 BV 号，请粘贴完整的分享链接', 400)
-
-    const cached = debug ? null : cachedResult(bvid)
+    const directBvid = raw.match(BVID_RE)?.[0]
+    const cached = debug || !directBvid ? null : cachedResult(directBvid)
     if (cached) {
-      console.log('bili parse: cache hit', { requestId, bvid, source: cached.source })
+      console.log('bili parse: cache hit', {
+        requestId,
+        bvid: cached.bvid,
+        source: cached.source,
+      })
       return reply({ ok: true, requestId, ...cached }, 200, requestId)
     }
+
+    const success = (result: ParseResult) => {
+      cacheResult(result.bvid, result)
+      console.log('bili parse: success', {
+        requestId,
+        bvid: result.bvid,
+        source: result.source,
+        quality: result.quality,
+        elapsedMs: Date.now() - started,
+      })
+      return reply(
+        {
+          ok: true,
+          requestId,
+          ...result,
+          ...(debug ? { trace } : {}),
+        },
+        200,
+        requestId,
+      )
+    }
+
+    const own = await tryOwnParser(raw, requestId, trace)
+    if (own) return success(own)
+
+    const bvid = directBvid ?? (await resolveBvid(raw, requestId, trace))
+    if (!bvid) return fail('没找到 BV 号，请粘贴完整的分享链接', 400)
 
     const result = await tryPublicParsers(bvid, requestId, trace)
     if (!result) {
       return fail('解析服务暂时不可用，请稍后重试', 502)
     }
 
-    cacheResult(bvid, result)
-    console.log('bili parse: success', {
-      requestId,
-      bvid,
-      source: result.source,
-      quality: result.quality,
-      elapsedMs: Date.now() - started,
-    })
-    return reply(
-      {
-        ok: true,
-        requestId,
-        ...result,
-        ...(debug ? { trace } : {}),
-      },
-      200,
-      requestId,
-    )
+    return success(result)
   } catch (reason) {
     const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
     console.error('bili parse: failed', {
