@@ -55,7 +55,7 @@ function BilibiliTool() {
       if (!data) {
         throw new Error(
           response.status === 404
-            ? '没有找到解析接口，这次部署可能没带上 functions/ 目录'
+            ? '没有找到解析接口，请确认 Cloudflare Worker 已部署'
             : `接口返回 ${response.status}：${body.trim().slice(0, 120) || '空响应'}`,
         )
       }
@@ -123,7 +123,7 @@ function BilibiliTool() {
       {loading && (
         <div className="flex flex-col items-center gap-2 rounded-2xl border border-zinc-200/80 bg-white py-10">
           <LoaderCircle className="size-5 animate-spin text-rose-500" />
-          <p className="text-xs text-zinc-400">正在向 B 站请求视频地址</p>
+          <p className="text-xs text-zinc-400">正在请求解析服务</p>
         </div>
       )}
 

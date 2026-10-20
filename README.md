@@ -24,9 +24,10 @@
 
 二维码在浏览器内绘制到 canvas，下载的 PNG / SVG 都不带任何水印，中文内容按 UTF-8 编码。
 
-B 站视频下载通过 `worker/index.ts` 转发：浏览器既无法设置 Referer，
-也跨不过 `api.bilibili.com` 的 CORS，因此这一跳必须放在服务端。视频取的是整段 MP4
-（音视频已合在一起），不挑清晰度；下载时同样由 Worker 补上 Referer 再转发。
+B 站视频下载由 `worker/index.ts` 调用第三方解析接口完成。解析时优先请求
+`api.injahow.cn`，失败后自动切换到 `bili.nekocha.top`；Worker 不会直连
+`api.bilibili.com`。视频取整段 MP4（音视频已合在一起），不挑清晰度，下载时由 Worker
+补上 Referer 再转发。
 
 ## 本地开发
 
@@ -44,7 +45,8 @@ npx wrangler dev
 
 ## 部署
 
-代码推到 GitHub `main` 分支，Cloudflare Workers 自动构建发布，线上地址 `https://tb.lblbk.top`。
+代码推到 GitHub `main` 分支，Cloudflare Workers 自动构建发布。默认地址为
+`https://toolbox.lblbk.workers.dev`，也可以绑定自己的域名。
 
 在 Cloudflare 控制台进入 **Workers & Pages → Create → Workers → Connect to Git**，选择
 `lblbk/toolbox`，然后填写：
@@ -59,8 +61,7 @@ npx wrangler dev
 `wrangler.toml` 会把 `dist/` 作为静态资源发布，同时把 `/api/*` 交给 `worker/index.ts`。
 项目使用 hash 路由（`#qr`、`#bilibili`），静态资源不需要额外的 SPA 回退规则。
 
-Worker 创建后，在 **Settings → Domains & Routes** 中把 `tb.lblbk.top` 添加为 Custom Domain。
-如果这个域名当前绑在旧的 Pages 项目上，需要先解绑，再绑定到新的 Worker。
+如果需要自定义域名，在 **Settings → Domains & Routes** 中添加 Custom Domain。
 
 Worker 日志默认开启，可在 **Workers & Pages → toolbox → Logs** 中按时间查询，
 也可以在本地执行：
@@ -72,7 +73,7 @@ npx wrangler tail
 部署后验证接口：
 
 ```bash
-curl "https://tb.lblbk.top/api/bili?bvid=BV1P88w6xE2u"
+curl "https://toolbox.lblbk.workers.dev/api/bili?bvid=BV1P88w6xE2u"
 ```
 
 返回带 `files` 的 JSON 就说明 Worker 和接口都已生效。

@@ -1,18 +1,26 @@
 /**
- * Cloudflare Worker：托管静态站点，并处理 B 站解析与下载转发。
+ * Cloudflare Worker：托管静态站点，并通过第三方服务解析 B 站视频。
  *
- * 浏览器的 fetch 既无法带 Referer，也跨不过 api.bilibili.com 的 CORS，
- * 所以 B 站接口需要经过 Worker 转发。视频取 platform=html5 的整段 MP4，
- * 音视频已合在一起，不挑清晰度。
+ * B 站会限制 Cloudflare 的出口 IP，因此这里不直接请求 api.bilibili.com。
+ * injahow 响应更快，优先使用；失败时再调用 nekocha 获取完整信息和下载地址。
  */
 
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 
-const BVID = /BV[0-9A-Za-z]{10}/
-const SHORT_LINK = /https?:\/\/b23\.tv\/[0-9A-Za-z]+/
-const ALLOWED_DOWNLOAD_HOSTS = ['bilivideo.com', 'bilivideo.cn', 'akamaized.net', 'bilibili.com']
+const BVID_RE = /BV[0-9A-Za-z]{10}/
+const SHORT_LINK_RE = /https?:\/\/b23\.tv\/[0-9A-Za-z]+/
+const INJAHOW_API = 'https://api.injahow.cn/bparse/'
+const NEKOCHA_API = 'https://bili.nekocha.top/video'
+const ALLOWED_DOWNLOAD_HOSTS = [
+  'bilivideo.com',
+  'bilivideo.cn',
+  'akamaized.net',
+  'bilibili.com',
+]
 const PASS_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag']
+const CACHE_TTL = 10 * 60 * 1000
+const CACHE_MAX = 80
 
 type Env = {
   ASSETS: {
@@ -20,196 +28,311 @@ type Env = {
   }
 }
 
-type BiliData = {
-  bvid?: string
-  title?: string
-  pic?: string
-  duration?: number
-  cid?: number
-  owner?: { name?: string }
-  pages?: { cid?: number }[]
-  quality?: number
-  durl?: { url?: string; size?: number; order?: number }[]
-  support_formats?: { quality?: number; new_description?: string }[]
+type JsonObject = Record<string, unknown>
+
+type VideoFile = {
+  url: string
+  size: number
+  order: number
 }
 
-type BiliJson = { code?: number; message?: string; data?: BiliData }
+type ParseResult = {
+  source: 'injahow' | 'nekocha'
+  bvid: string
+  title: string
+  cover: string
+  up: string
+  duration: number
+  quality: string
+  files: VideoFile[]
+}
 
-/** 一次上游调用：data 为 null 表示返回的不是 JSON（风控页、空响应等） */
-type Call = { status: number; data: BiliJson | null; snippet: string; type: string }
+type CacheEntry = {
+  expiresAt: number
+  result: ParseResult
+}
 
-const reply = (data: unknown, status = 200) =>
-  new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      'content-type': 'application/json; charset=utf-8',
-      'cache-control': 'no-store',
-    },
+const resultCache = new Map<string, CacheEntry>()
+
+const reply = (data: unknown, status = 200, requestId = '') => {
+  const headers = new Headers({
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'access-control-allow-origin': '*',
   })
-
-function biliApi(path: string, cookie = '') {
-  const headers: Record<string, string> = {
-    'user-agent': UA,
-    referer: 'https://www.bilibili.com/',
-    origin: 'https://www.bilibili.com',
-    accept: 'application/json, text/plain, */*',
-  }
-  if (cookie) headers.cookie = cookie
-  return fetch(`https://api.bilibili.com${path}`, { headers })
+  if (requestId) headers.set('x-request-id', requestId)
+  return new Response(JSON.stringify(data), { status, headers })
 }
 
-async function call(path: string, cookie: string, trace: string[]): Promise<Call> {
-  const label = `${cookie ? '带 cookie' : '不带 cookie'} ${path}`
-  let response: Response
+const isObject = (value: unknown): value is JsonObject =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+const textValue = (value: unknown) => (typeof value === 'string' ? value : '')
+
+function qualityLabel(value: unknown) {
+  const labels: Record<number, string> = {
+    6: '240P',
+    16: '360P',
+    32: '480P',
+    64: '720P',
+    74: '720P60',
+    80: '1080P',
+    100: '智能修复',
+    112: '1080P+',
+    116: '1080P60',
+    120: '4K',
+    125: 'HDR',
+    126: '杜比视界',
+    127: '8K',
+  }
+  const quality = Number(value)
+  return Number.isFinite(quality) ? (labels[quality] ?? String(quality)) : ''
+}
+
+function cachedResult(bvid: string) {
+  const cached = resultCache.get(bvid)
+  if (!cached) return null
+  if (cached.expiresAt <= Date.now()) {
+    resultCache.delete(bvid)
+    return null
+  }
+  return cached.result
+}
+
+function cacheResult(bvid: string, result: ParseResult) {
+  if (resultCache.size >= CACHE_MAX) {
+    const oldest = resultCache.keys().next().value
+    if (oldest) resultCache.delete(oldest)
+  }
+  resultCache.set(bvid, {
+    expiresAt: Date.now() + CACHE_TTL,
+    result,
+  })
+}
+
+async function resolveBvid(raw: string, requestId: string, trace: string[]) {
+  const direct = raw.match(BVID_RE)?.[0]
+  if (direct) return direct
+
+  const short = raw.match(SHORT_LINK_RE)?.[0]
+  if (!short) return null
+
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10_000)
   try {
-    response = await biliApi(path, cookie)
+    const started = Date.now()
+    const response = await fetch(short, {
+      headers: { 'user-agent': UA },
+      redirect: 'follow',
+      signal: controller.signal,
+    })
+    const bvid = response.url.match(BVID_RE)?.[0] ?? (await response.text()).match(BVID_RE)?.[0]
+    trace.push(
+      `b23.tv -> HTTP ${response.status} ${bvid ? `BV ${bvid}` : '未找到 BV 号'} (${Date.now() - started}ms)`,
+    )
+    console.log('bili parse: short link', {
+      requestId,
+      status: response.status,
+      bvid: bvid ?? '',
+      elapsedMs: Date.now() - started,
+    })
+    return bvid ?? null
   } catch (reason) {
     const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
-    trace.push(`${label} -> 请求失败 ${message}`)
-    throw new Error(`连接 B 站接口失败（${message}）`)
+    trace.push(`b23.tv -> 请求失败：${message}`)
+    console.warn('bili parse: short link failed', { requestId, message })
+    return null
+  } finally {
+    clearTimeout(timeout)
   }
+}
 
-  const body = await response.text()
-  let data: BiliJson | null = null
+async function publicJson(url: URL, source: string, requestId: string, trace: string[]) {
+  const started = Date.now()
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 10_000)
+
   try {
-    data = JSON.parse(body) as BiliJson
-  } catch {
-    data = null
-  }
+    const response = await fetch(url, {
+      headers: {
+        accept: 'application/json, text/plain, */*',
+        'user-agent': UA,
+      },
+      signal: controller.signal,
+    })
+    const body = await response.text()
+    let data: JsonObject | null = null
+    try {
+      const parsed: unknown = JSON.parse(body)
+      data = isObject(parsed) ? parsed : null
+    } catch {
+      data = null
+    }
 
-  const snippet = data ? '' : body.trim().slice(0, 200)
-  trace.push(
-    `${label} -> ${response.status} ${response.headers.get('content-type') ?? '无类型'} ${
-      data ? `code ${data.code} ${data.message ?? ''}`.trim() : `非 JSON：${snippet || '空响应'}`
-    }`,
-  )
+    const elapsedMs = Date.now() - started
+    const detail = data
+      ? `HTTP ${response.status} code ${String(data.code ?? '-')} ${textValue(data.message)}`.trim()
+      : `HTTP ${response.status} 非 JSON：${body.trim().slice(0, 120) || '空响应'}`
+    trace.push(`${source} -> ${detail} (${elapsedMs}ms)`)
+    console.log('bili parse: upstream', {
+      requestId,
+      source,
+      status: response.status,
+      code: data?.code ?? null,
+      json: Boolean(data),
+      elapsedMs,
+    })
+    return { data }
+  } catch (reason) {
+    const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
+    trace.push(`${source} -> 请求失败：${message} (${Date.now() - started}ms)`)
+    console.warn('bili parse: upstream failed', {
+      requestId,
+      source,
+      message,
+      elapsedMs: Date.now() - started,
+    })
+    return { data: null }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+function validVideoUrl(value: unknown) {
+  if (typeof value !== 'string' || !value.startsWith('https://')) return false
+  try {
+    const { hostname } = new URL(value)
+    return ALLOWED_DOWNLOAD_HOSTS.some(
+      (host) => hostname === host || hostname.endsWith(`.${host}`),
+    )
+  } catch {
+    return false
+  }
+}
+
+function normalizeInjahow(data: JsonObject | null, bvid: string): ParseResult | null {
+  if (!data || data.code !== 0 || !validVideoUrl(data.url)) return null
 
   return {
-    status: response.status,
-    data,
-    snippet,
-    type: response.headers.get('content-type') ?? '',
+    source: 'injahow',
+    bvid,
+    title: `B 站视频 ${bvid}`,
+    cover: '',
+    up: '',
+    duration: 0,
+    quality: qualityLabel(data.quality),
+    files: [{ url: data.url as string, size: 0, order: 1 }],
   }
 }
 
-function describe(result: Call, step: string) {
-  const { data, status, snippet } = result
-  if (data?.message) return `${step}失败：${data.message}（code ${data.code}）`
-  if (snippet) return `${step}失败：B 站返回 ${status}，内容不是 JSON：${snippet}`
-  return `${step}失败：B 站返回 ${status}`
-}
+function normalizeNekocha(data: JsonObject | null, bvid: string): ParseResult | null {
+  if (!data || data.code !== 200 || !isObject(data.data)) return null
 
-/** 首页会下发 buvid3 等 cookie，接口风控拦截（-412）时用它重试 */
-async function homeCookie() {
-  try {
-    const response = await fetch('https://www.bilibili.com/', { headers: { 'user-agent': UA } })
-    const headers = response.headers as Headers & { getSetCookie?: () => string[] }
-    return (headers.getSetCookie?.() ?? [])
-      .map((value) => value.split(';')[0])
-      .join('; ')
-  } catch {
-    return ''
+  const detail = data.data
+  const play = isObject(detail.play) ? detail.play : null
+  if (!play || !validVideoUrl(play.url)) return null
+
+  const owner = isObject(detail.owner) ? detail.owner : null
+  return {
+    source: 'nekocha',
+    bvid: textValue(detail.bvid) || bvid,
+    title: textValue(detail.title) || `B 站视频 ${bvid}`,
+    cover: textValue(detail.pic).replace(/^http:/, 'https:'),
+    up: textValue(owner?.name),
+    duration: Number(detail.duration) || 0,
+    quality: qualityLabel(play.realQuality ?? play.quality),
+    files: [{ url: play.url as string, size: 0, order: 1 }],
   }
 }
 
-/** 首页也拿不到 cookie 时自己造一个 buvid3，风控接口带上它更容易放行 */
-function fakeCookie() {
-  return `buvid3=${crypto.randomUUID().toUpperCase()}infoc; b_nut=${Math.floor(Date.now() / 1000)}`
+async function tryPublicParsers(bvid: string, requestId: string, trace: string[]) {
+  const injahow = new URL(INJAHOW_API)
+  injahow.searchParams.set('bv', bvid)
+  injahow.searchParams.set('p', '1')
+  injahow.searchParams.set('q', '64')
+  injahow.searchParams.set('format', 'mp4')
+  injahow.searchParams.set('otype', 'json')
+
+  const fast = await publicJson(injahow, 'injahow', requestId, trace)
+  const fastResult = normalizeInjahow(fast.data, bvid)
+  if (fastResult) return fastResult
+
+  const nekocha = new URL(`${NEKOCHA_API}/${encodeURIComponent(bvid)}`)
+  nekocha.searchParams.set('type', 'json')
+  nekocha.searchParams.set('format', 'mp4')
+  nekocha.searchParams.set('qn', '64')
+
+  const full = await publicJson(nekocha, 'nekocha', requestId, trace)
+  return normalizeNekocha(full.data, bvid)
 }
 
 async function handleBili(request: Request): Promise<Response> {
+  const started = Date.now()
+  const params = new URL(request.url).searchParams
+  const debug = params.has('debug')
+  const requestId = request.headers.get('cf-ray') || crypto.randomUUID()
   const trace: string[] = []
-  let debug = false
+
+  console.log('bili parse: request', {
+    requestId,
+    debug,
+    hasText: params.has('text'),
+    hasBvid: params.has('bvid'),
+  })
+
+  const fail = (message: string, status: number) => {
+    const payload = { ok: false, requestId, message, ...(debug ? { trace } : {}) }
+    const details = { requestId, status, message, trace, elapsedMs: Date.now() - started }
+    if (status >= 500) console.error('bili parse: response', details)
+    else console.log('bili parse: response', details)
+    return reply(payload, status, requestId)
+  }
 
   try {
-    const params = new URL(request.url).searchParams
-    debug = params.has('debug')
-    const fail = (message: string, status: number) => {
-      const payload = { ok: false, message, ...(debug ? { trace } : {}) }
-      if (status >= 500) {
-        console.error('bili parse: response', { status, message, trace })
-      } else {
-        console.log('bili parse: response', { status, message })
-      }
-      return reply(payload, status)
-    }
     const raw = `${params.get('text') ?? ''} ${params.get('bvid') ?? ''}`.trim()
-    if (!raw) {
-      console.log('bili parse: missing link')
-      return fail('没有收到链接', 400)
+    if (!raw) return fail('没有收到链接', 400)
+
+    const bvid = await resolveBvid(raw, requestId, trace)
+    if (!bvid) return fail('没找到 BV 号，请粘贴完整的分享链接', 400)
+
+    const cached = debug ? null : cachedResult(bvid)
+    if (cached) {
+      console.log('bili parse: cache hit', { requestId, bvid, source: cached.source })
+      return reply({ ok: true, requestId, ...cached }, 200, requestId)
     }
 
-    let cookie = ''
-    // 第一次不带 cookie，被风控拦下（-412 / 非 JSON）就带着首页 cookie 再来一次
-    const load = async (path: string) => {
-      let result = await call(path, '', trace)
-      if (result.data?.code !== 0) {
-        cookie ||= (await homeCookie()) || fakeCookie()
-        result = await call(path, cookie, trace)
-      }
-      return result
+    const result = await tryPublicParsers(bvid, requestId, trace)
+    if (!result) {
+      return fail('解析服务暂时不可用，请稍后重试', 502)
     }
 
-    let bvid = raw.match(BVID)?.[0]
-
-    // b23.tv 短链要先跟着跳转，才能看到真实地址里的 BV 号
-    if (!bvid) {
-      const short = raw.match(SHORT_LINK)?.[0]
-      if (!short) return fail('没找到 BV 号，请粘贴完整的分享链接', 400)
-      const response = await fetch(short, { headers: { 'user-agent': UA }, redirect: 'follow' })
-      bvid = response.url.match(BVID)?.[0] ?? (await response.text()).match(BVID)?.[0]
-      if (!bvid) return fail('短链解析失败，请换成完整链接', 400)
-    }
-
-    console.log('bili parse: start', { bvid, debug })
-
-    const info = await load(`/x/web-interface/view?bvid=${bvid}`)
-    if (info.data?.code !== 0 || !info.data.data) {
-      if (info.data?.code === -404) return fail('视频不存在或已下架', 404)
-      return fail(describe(info, '获取视频信息'), 502)
-    }
-
-    const detail = info.data.data
-    const cid = detail.pages?.[0]?.cid ?? detail.cid
-    if (!cid) return fail('没有拿到视频的分P信息', 502)
-
-    const play = await load(
-      `/x/player/playurl?bvid=${bvid}&cid=${cid}&qn=64&fnval=1&fnver=0&fourk=0&platform=html5&high_quality=1`,
-    )
-    if (play.data?.code !== 0) {
-      return fail(describe(play, '获取播放地址'), 502)
-    }
-
-    const playData = play.data.data
-    const files = (playData?.durl ?? [])
-      .map((part, index) => ({
-        url: part.url ?? '',
-        size: part.size ?? 0,
-        order: part.order ?? index + 1,
-      }))
-      .filter((file) => file.url.startsWith('http'))
-
-    if (files.length === 0) {
-      return fail('这个视频没有可直接下载的地址，可能是番剧、付费或充电专属内容', 404)
-    }
-
-    const format = playData?.support_formats?.find((item) => item.quality === playData.quality)
-    console.log('bili parse: success', { bvid, files: files.length })
-
-    return reply({
-      ok: true,
+    cacheResult(bvid, result)
+    console.log('bili parse: success', {
+      requestId,
       bvid,
-      title: detail.title ?? bvid,
-      cover: detail.pic ?? '',
-      up: detail.owner?.name ?? '',
-      duration: detail.duration ?? 0,
-      quality: format?.new_description ?? '',
-      files,
+      source: result.source,
+      quality: result.quality,
+      elapsedMs: Date.now() - started,
     })
+    return reply(
+      {
+        ok: true,
+        requestId,
+        ...result,
+        ...(debug ? { trace } : {}),
+      },
+      200,
+      requestId,
+    )
   } catch (reason) {
     const message = reason instanceof Error ? `${reason.name}: ${reason.message}` : String(reason)
-    console.error('bili parse: failed', { message, trace })
-    return reply({ ok: false, message: `解析失败：${message}`, ...(debug ? { trace } : {}) }, 502)
+    console.error('bili parse: failed', {
+      requestId,
+      message,
+      trace,
+      elapsedMs: Date.now() - started,
+    })
+    return fail(`解析失败：${message}`, 502)
   }
 }
 
@@ -233,10 +356,7 @@ function asciiName(value: string) {
 
 async function handleDownload(request: Request): Promise<Response> {
   const fail = (message: string, status: number) =>
-    new Response(JSON.stringify({ ok: false, message }), {
-      status,
-      headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
-    })
+    reply({ ok: false, message }, status)
 
   try {
     const params = new URL(request.url).searchParams
@@ -257,7 +377,6 @@ async function handleDownload(request: Request): Promise<Response> {
     })
 
     console.log('bili download: upstream', { host, status: upstream.status })
-
     if (!upstream.ok && upstream.status !== 206) {
       return fail(`源站返回 ${upstream.status}，请稍后重试或改用直链下载`, 502)
     }
