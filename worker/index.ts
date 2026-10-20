@@ -23,6 +23,10 @@ const ALLOWED_DOWNLOAD_HOSTS = [
 const PASS_HEADERS = ['content-type', 'content-length', 'content-range', 'accept-ranges', 'etag']
 const CACHE_TTL = 10 * 60 * 1000
 const CACHE_MAX = 80
+const QUALITY_VALUES = [16, 32, 64, 80] as const
+const DEFAULT_QUALITY: Quality = 64
+
+type Quality = (typeof QUALITY_VALUES)[number]
 
 type Env = {
   ASSETS: {
@@ -91,22 +95,32 @@ function qualityLabel(value: unknown) {
   return Number.isFinite(quality) ? (labels[quality] ?? String(quality)) : ''
 }
 
-function cachedResult(bvid: string) {
-  const cached = resultCache.get(bvid)
+function parseQuality(value: string | null): Quality {
+  const quality = Number(value)
+  return QUALITY_VALUES.includes(quality as Quality) ? (quality as Quality) : DEFAULT_QUALITY
+}
+
+function cacheKey(bvid: string, quality: Quality) {
+  return `${bvid}:${quality}`
+}
+
+function cachedResult(bvid: string, quality: Quality) {
+  const key = cacheKey(bvid, quality)
+  const cached = resultCache.get(key)
   if (!cached) return null
   if (cached.expiresAt <= Date.now()) {
-    resultCache.delete(bvid)
+    resultCache.delete(key)
     return null
   }
   return cached.result
 }
 
-function cacheResult(bvid: string, result: ParseResult) {
+function cacheResult(bvid: string, quality: Quality, result: ParseResult) {
   if (resultCache.size >= CACHE_MAX) {
     const oldest = resultCache.keys().next().value
     if (oldest) resultCache.delete(oldest)
   }
-  resultCache.set(bvid, {
+  resultCache.set(cacheKey(bvid, quality), {
     expiresAt: Date.now() + CACHE_TTL,
     result,
   })
@@ -224,7 +238,10 @@ function unwrapOwnProxy(value: string) {
   }
 }
 
-function normalizeOwnParser(data: JsonObject | null): ParseResult | null {
+function normalizeOwnParser(
+  data: JsonObject | null,
+  requestedQuality: Quality,
+): ParseResult | null {
   if (!data || data.status !== 'success') return null
 
   const bvid = textValue(data.bvid)
@@ -239,7 +256,7 @@ function normalizeOwnParser(data: JsonObject | null): ParseResult | null {
     cover: textValue(data.pic).replace(/^http:/, 'https:'),
     up: textValue(data.author),
     duration: 0,
-    quality: qualityLabel(data.quality),
+    quality: qualityLabel(data.quality) || qualityLabel(requestedQuality),
     files: [{ url: fileUrl, size: 0, order: 1 }],
   }
 }
@@ -256,16 +273,25 @@ function validVideoUrl(value: unknown) {
   }
 }
 
-async function tryOwnParser(raw: string, requestId: string, trace: string[]) {
+async function tryOwnParser(
+  raw: string,
+  quality: Quality,
+  requestId: string,
+  trace: string[],
+) {
   const url = new URL(OWN_BILI_API)
   url.searchParams.set('text', raw)
-  url.searchParams.set('qn', '64')
+  url.searchParams.set('qn', String(quality))
 
   const response = await publicJson(url, 'biliapi', requestId, trace, 25_000)
-  return normalizeOwnParser(response.data)
+  return normalizeOwnParser(response.data, quality)
 }
 
-function normalizeInjahow(data: JsonObject | null, bvid: string): ParseResult | null {
+function normalizeInjahow(
+  data: JsonObject | null,
+  bvid: string,
+  requestedQuality: Quality,
+): ParseResult | null {
   if (!data || data.code !== 0 || !validVideoUrl(data.url)) return null
 
   return {
@@ -275,12 +301,16 @@ function normalizeInjahow(data: JsonObject | null, bvid: string): ParseResult | 
     cover: '',
     up: '',
     duration: 0,
-    quality: qualityLabel(data.quality),
+    quality: qualityLabel(data.quality) || qualityLabel(requestedQuality),
     files: [{ url: data.url as string, size: 0, order: 1 }],
   }
 }
 
-function normalizeNekocha(data: JsonObject | null, bvid: string): ParseResult | null {
+function normalizeNekocha(
+  data: JsonObject | null,
+  bvid: string,
+  requestedQuality: Quality,
+): ParseResult | null {
   if (!data || data.code !== 200 || !isObject(data.data)) return null
 
   const detail = data.data
@@ -295,42 +325,50 @@ function normalizeNekocha(data: JsonObject | null, bvid: string): ParseResult | 
     cover: textValue(detail.pic).replace(/^http:/, 'https:'),
     up: textValue(owner?.name),
     duration: Number(detail.duration) || 0,
-    quality: qualityLabel(play.realQuality ?? play.quality),
+    quality:
+      qualityLabel(play.realQuality ?? play.quality) || qualityLabel(requestedQuality),
     files: [{ url: play.url as string, size: 0, order: 1 }],
   }
 }
 
-async function tryPublicParsers(bvid: string, requestId: string, trace: string[]) {
+async function tryPublicParsers(
+  bvid: string,
+  quality: Quality,
+  requestId: string,
+  trace: string[],
+) {
   const injahow = new URL(INJAHOW_API)
   injahow.searchParams.set('bv', bvid)
   injahow.searchParams.set('p', '1')
-  injahow.searchParams.set('q', '64')
+  injahow.searchParams.set('q', String(quality))
   injahow.searchParams.set('format', 'mp4')
   injahow.searchParams.set('otype', 'json')
 
   const fast = await publicJson(injahow, 'injahow', requestId, trace)
-  const fastResult = normalizeInjahow(fast.data, bvid)
+  const fastResult = normalizeInjahow(fast.data, bvid, quality)
   if (fastResult) return fastResult
 
   const nekocha = new URL(`${NEKOCHA_API}/${encodeURIComponent(bvid)}`)
   nekocha.searchParams.set('type', 'json')
   nekocha.searchParams.set('format', 'mp4')
-  nekocha.searchParams.set('qn', '64')
+  nekocha.searchParams.set('qn', String(quality))
 
   const full = await publicJson(nekocha, 'nekocha', requestId, trace)
-  return normalizeNekocha(full.data, bvid)
+  return normalizeNekocha(full.data, bvid, quality)
 }
 
 async function handleBili(request: Request): Promise<Response> {
   const started = Date.now()
   const params = new URL(request.url).searchParams
   const debug = params.has('debug')
+  const quality = parseQuality(params.get('qn'))
   const requestId = request.headers.get('cf-ray') || crypto.randomUUID()
   const trace: string[] = []
 
   console.log('bili parse: request', {
     requestId,
     debug,
+    quality,
     hasText: params.has('text'),
     hasBvid: params.has('bvid'),
   })
@@ -348,23 +386,25 @@ async function handleBili(request: Request): Promise<Response> {
     if (!raw) return fail('没有收到链接', 400)
 
     const directBvid = raw.match(BVID_RE)?.[0]
-    const cached = debug || !directBvid ? null : cachedResult(directBvid)
+    const cached = debug || !directBvid ? null : cachedResult(directBvid, quality)
     if (cached) {
       console.log('bili parse: cache hit', {
         requestId,
         bvid: cached.bvid,
+        quality,
         source: cached.source,
       })
       return reply({ ok: true, requestId, ...cached }, 200, requestId)
     }
 
     const success = (result: ParseResult) => {
-      cacheResult(result.bvid, result)
+      cacheResult(result.bvid, quality, result)
       console.log('bili parse: success', {
         requestId,
         bvid: result.bvid,
         source: result.source,
-        quality: result.quality,
+        requestedQuality: quality,
+        actualQuality: result.quality,
         elapsedMs: Date.now() - started,
       })
       return reply(
@@ -379,13 +419,13 @@ async function handleBili(request: Request): Promise<Response> {
       )
     }
 
-    const own = await tryOwnParser(raw, requestId, trace)
+    const own = await tryOwnParser(raw, quality, requestId, trace)
     if (own) return success(own)
 
     const bvid = directBvid ?? (await resolveBvid(raw, requestId, trace))
     if (!bvid) return fail('没找到 BV 号，请粘贴完整的分享链接', 400)
 
-    const result = await tryPublicParsers(bvid, requestId, trace)
+    const result = await tryPublicParsers(bvid, quality, requestId, trace)
     if (!result) {
       return fail('解析服务暂时不可用，请稍后重试', 502)
     }
