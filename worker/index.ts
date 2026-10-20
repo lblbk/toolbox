@@ -5,6 +5,8 @@
  * 优先使用自建 biliapi，失败时再调用公开服务作为备用。
  */
 
+import { handleSocialDownload, handleSocialResolve } from './social'
+
 const UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
 
@@ -517,6 +519,8 @@ export default {
 
     if (path === '/api/bili') return handleBili(request)
     if (path === '/api/bili-download') return handleDownload(request)
+    if (path === '/api/social') return handleSocialResolve(request)
+    if (path === '/api/social-download') return handleSocialDownload(request)
     if (path.startsWith('/api/')) return reply({ ok: false, message: '接口不存在' }, 404)
 
     return env.ASSETS.fetch(request)

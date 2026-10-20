@@ -99,7 +99,7 @@ export default function App() {
                   {query.trim() ? '搜索结果' : '全部工具'}
                 </h2>
                 <p className="mt-1 text-[13px] text-zinc-500">
-                  绝大多数工具在浏览器本地运行，输入内容不上传
+                  常用工具在浏览器本地运行，媒体解析按需调用 Worker
                 </p>
               </div>
               <span className="shrink-0 rounded-full border border-zinc-200/80 bg-white px-2.5 py-1 text-xs font-medium text-zinc-500 shadow-sm">
@@ -122,7 +122,7 @@ export default function App() {
       </main>
 
       <footer className="mx-auto w-full max-w-4xl px-4 pb-8 sm:px-6">
-        <p className="text-xs text-zinc-400">工具箱 · {tools.length} 个本地小工具</p>
+        <p className="text-xs text-zinc-400">工具箱 · {tools.length} 个小工具</p>
       </footer>
 
       {activeTool && <ToolModal tool={activeTool} onClose={close} />}

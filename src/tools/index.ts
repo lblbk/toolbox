@@ -4,10 +4,12 @@ import { jsonTool } from './JsonTool'
 import { base64Tool } from './Base64Tool'
 import { timestampTool } from './TimestampTool'
 import { bilibiliTool } from './BilibiliTool'
+import { socialTool } from './SocialTool'
 
 export const tools: ToolDefinition[] = [
   qrTool,
   bilibiliTool,
+  socialTool,
   jsonTool,
   base64Tool,
   timestampTool,
