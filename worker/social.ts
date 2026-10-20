@@ -8,7 +8,9 @@ const X_SHARE_HOSTS = ['x.com', 'twitter.com']
 const XHS_MEDIA_HOSTS = ['xhscdn.com', 'xiaohongshu.com']
 const X_MEDIA_HOSTS = ['twimg.com']
 const XHS_LOGIN_RE =
-  /登录后查看|请先登录|登录后继续|扫码登录|login|sign in/i
+  /登录后查看|请先登录|登录后继续|扫码登录/i
+const XHS_UNAVAILABLE_RE =
+  /当前笔记暂时无法浏览|笔记暂时无法浏览|笔记不存在|内容不存在|笔记已删除|当前内容无法展示/u
 const X_API_BASES = ['https://api.fxtwitter.com', 'https://api.vxtwitter.com']
 const PASS_HEADERS = [
   'content-type',
@@ -42,6 +44,16 @@ type SocialResult = {
   sourceUrl: string
   media: SocialMedia[]
   warnings: string[]
+}
+
+type XhsPage = {
+  url: URL
+  html: string
+}
+
+type XhsPageIssue = {
+  code: string
+  message: string
 }
 
 class SocialRequestError extends Error {
@@ -186,13 +198,67 @@ function htmlRedirect(html: string, currentUrl: string) {
 }
 
 function isXhsLoginPage(url: URL, html: string) {
-  if (url.hostname.endsWith('xiaohongshu.com') && url.pathname === '/login') {
+  const pathname = url.pathname.toLowerCase()
+  if (
+    url.hostname.endsWith('xiaohongshu.com') &&
+    (pathname === '/login' ||
+      pathname.startsWith('/login/') ||
+      pathname.includes('website-login'))
+  ) {
     return true
   }
 
   return (
     !html.includes('window.__INITIAL_STATE__') &&
     XHS_LOGIN_RE.test(html)
+  )
+}
+
+function decoded(value: string) {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+function xhsPageIssue(url: URL, html: string): XhsPageIssue | null {
+  const pageText = decoded(`${url.pathname}${url.search}\n${html}`)
+  const code =
+    pageText.match(/(?:error_code|errorCode)["'=:\s]+(-?\d+)/i)?.[1] ?? ''
+  const knownMessage =
+    pageText.match(XHS_UNAVAILABLE_RE)?.[0] ?? ''
+  const unavailablePath = /^\/404(?:\/|$)/.test(url.pathname)
+  const unavailableCode = code === '300031'
+
+  if (!unavailablePath && !unavailableCode && !knownMessage) return null
+
+  return {
+    code,
+    message: knownMessage || (unavailablePath ? '笔记页面不存在或当前无法浏览' : ''),
+  }
+}
+
+function canonicalXhsNoteUrl(url: URL) {
+  const noteId = url.pathname.match(
+    /^\/discovery\/item\/([^/]+)\/?$/,
+  )?.[1]
+  if (!noteId || !hostMatches(url.hostname, ['xiaohongshu.com'])) return null
+
+  const canonical = new URL(url)
+  canonical.pathname = `/explore/${noteId}`
+  return canonical
+}
+
+function xhsUnavailableError(issue: XhsPageIssue) {
+  const source = issue.message
+    ? `，源站提示“${issue.message}”`
+    : issue.code
+      ? `，源站错误码 ${issue.code}`
+      : ''
+  return new SocialRequestError(
+    `小红书暂时不允许匿名解析这条笔记${source}。请确认链接能在未登录浏览器中打开，或重新复制完整分享链接后再试`,
+    422,
   )
 }
 
@@ -239,6 +305,10 @@ async function fetchXhsPageWithUa(
       continue
     }
 
+    if (response.status === 404) {
+      throw new SocialRequestError('小红书笔记不存在或当前无法浏览', 422)
+    }
+
     if (!response.ok) {
       throw new SocialRequestError(`小红书页面返回 ${response.status}`, 502)
     }
@@ -268,19 +338,97 @@ async function fetchXhsPage(
   requestId: string,
   trace: string[],
 ) {
-  const desktop = await fetchXhsPageWithUa(initial, DESKTOP_UA, requestId, trace)
-  if (!isXhsLoginPage(desktop.url, desktop.html)) return desktop
+  const queue: URL[] = [normalizedXhsUrl(initial.toString())]
+  const visited = new Set<string>()
+  let unavailable: XhsPageIssue | null = null
+  let loginPage: XhsPage | null = null
+  let unknownPage: XhsPage | null = null
 
-  trace.push('xiaohongshu desktop -> login page, retry anonymous mobile page')
-  console.log('social rednote: retry mobile page', { requestId })
-  const mobile = await fetchXhsPageWithUa(initial, MOBILE_UA, requestId, trace)
-  if (isXhsLoginPage(mobile.url, mobile.html)) {
+  const enqueueCanonical = (url: URL) => {
+    const canonical = canonicalXhsNoteUrl(url)
+    if (!canonical || visited.has(canonical.toString())) return
+    if (!queue.some((item) => item.toString() === canonical.toString())) {
+      queue.push(canonical)
+      trace.push(`xiaohongshu fallback -> ${canonical.pathname}`)
+    }
+  }
+
+  while (queue.length > 0 && visited.size < 4) {
+    const candidate = queue.shift()
+    if (!candidate) break
+    const candidateKey = candidate.toString()
+    if (visited.has(candidateKey)) continue
+    visited.add(candidateKey)
+
+    const desktop = await fetchXhsPageWithUa(
+      candidate,
+      DESKTOP_UA,
+      requestId,
+      trace,
+    )
+
+    const desktopIssue = xhsPageIssue(desktop.url, desktop.html)
+    if (desktopIssue) {
+      unavailable ??= desktopIssue
+      trace.push(
+        `xiaohongshu desktop -> unavailable${desktopIssue.code ? ` (${desktopIssue.code})` : ''}`,
+      )
+      enqueueCanonical(candidate)
+      enqueueCanonical(desktop.url)
+      continue
+    }
+
+    if (!isXhsLoginPage(desktop.url, desktop.html)) {
+      if (desktop.html.includes('window.__INITIAL_STATE__')) return desktop
+      unknownPage = desktop
+    } else {
+      loginPage = desktop
+    }
+
+    trace.push(
+      isXhsLoginPage(desktop.url, desktop.html)
+        ? 'xiaohongshu desktop -> login page, retry anonymous mobile page'
+        : 'xiaohongshu desktop -> no note data, retry anonymous mobile page',
+    )
+    console.log('social rednote: retry mobile page', { requestId })
+    const mobile = await fetchXhsPageWithUa(
+      candidate,
+      MOBILE_UA,
+      requestId,
+      trace,
+    )
+
+    const mobileIssue = xhsPageIssue(mobile.url, mobile.html)
+    if (mobileIssue) {
+      unavailable ??= mobileIssue
+      trace.push(
+        `xiaohongshu mobile -> unavailable${mobileIssue.code ? ` (${mobileIssue.code})` : ''}`,
+      )
+      enqueueCanonical(candidate)
+      enqueueCanonical(mobile.url)
+      continue
+    }
+
+    if (!isXhsLoginPage(mobile.url, mobile.html)) {
+      if (mobile.html.includes('window.__INITIAL_STATE__')) return mobile
+      unknownPage = mobile
+    } else {
+      loginPage = mobile
+    }
+    enqueueCanonical(candidate)
+    enqueueCanonical(desktop.url)
+    enqueueCanonical(mobile.url)
+  }
+
+  if (unavailable) throw xhsUnavailableError(unavailable)
+  if (loginPage) {
     throw new SocialRequestError(
       '小红书要求登录后才能查看这条笔记，请稍后重试公开笔记',
       422,
     )
   }
-  return mobile
+  if (unknownPage) return unknownPage
+  throw new SocialRequestError('无法读取小红书笔记页面，请稍后重试', 502)
 }
 
 function objectEnd(source: string, start: number) {
